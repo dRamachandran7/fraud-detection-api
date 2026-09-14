@@ -19,6 +19,6 @@ def predict(model, features: list[float]) -> dict:
     prediction = model.predict(arr)[0]
 
     return {
-        "is_fraud": prediction == -1,
+        "is_fraud": bool(prediction == -1),
         "score": float(raw_score),
     }
