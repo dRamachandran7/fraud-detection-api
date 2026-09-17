@@ -97,7 +97,7 @@ def _parse(raw: bytes) -> tuple[str | None, list[float]]:
     return transaction_id, features
 
 
-def _handle_message(model, producer: KafkaProducer, raw: bytes) -> None:
+def _handle_message(artifact: dict, producer: KafkaProducer, raw: bytes) -> None:
     """Score one message and publish the result.
 
     Message-level problems are dead-lettered. Broker-level problems propagate
@@ -110,7 +110,7 @@ def _handle_message(model, producer: KafkaProducer, raw: bytes) -> None:
         return
 
     try:
-        result = predict(model, features)
+        result = predict(artifact, features)
     except Exception as exc:  # model rejected input we could not anticipate
         _dead_letter(producer, raw, f"scoring failed: {exc}")
         return
@@ -120,7 +120,11 @@ def _handle_message(model, producer: KafkaProducer, raw: bytes) -> None:
         config.KAFKA_SCORES_TOPIC, key=transaction_id, value=result
     ).get(timeout=config.PRODUCER_ACK_TIMEOUT_SECONDS)
     logger.info(
-        "Scored transaction %s: is_fraud=%s", transaction_id, result["is_fraud"]
+        "Scored transaction %s: is_fraud=%s score=%.4f model=%s",
+        transaction_id,
+        result["is_fraud"],
+        result["score"],
+        result["model_version"],
     )
 
 
@@ -128,7 +132,14 @@ def run_consumer() -> None:
     """Consume raw transactions, score with the model, publish results."""
     _install_signal_handlers()
 
-    model = load_model()
+    artifact = load_model()
+    logger.info(
+        "Loaded model version %s (trained_at=%s, average_precision=%s)",
+        artifact["version"],
+        artifact.get("trained_at"),
+        artifact.get("metrics", {}).get("average_precision"),
+    )
+
     consumer = _build_consumer()
     producer = _build_producer()
 
@@ -141,7 +152,7 @@ def run_consumer() -> None:
             try:
                 for records in batches.values():
                     for message in records:
-                        _handle_message(model, producer, message.value)
+                        _handle_message(artifact, producer, message.value)
             except KafkaError:
                 # Leave the batch uncommitted; it will be redelivered.
                 logger.exception("Broker error while processing batch, not committing")

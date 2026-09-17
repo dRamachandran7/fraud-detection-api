@@ -49,27 +49,30 @@ published.
 
 ---
 
-## 3. No observability, and scores are not traceable to a model
+## 3. No observability
 
 **Priority: medium.**
 
-- No metrics of any kind: consumer lag, scoring latency, DLQ rate, and publish
-  failures are all invisible. Consumer lag is the one that matters most — it
-  is the only signal that the consumer group has fallen behind ingestion, and
-  the scaling story depends on being able to see it.
-- Output messages carry only `transaction_id`, `is_fraud`, and `score`. There
-  is no model version or scoring timestamp, so a score cannot be traced back
-  to the artifact that produced it. Once the model is retrained even once,
-  historical scores become uninterpretable. Stamp a version — a hash or a
-  build tag baked in at train time — onto both the artifact and every result
-  message.
+No metrics of any kind: consumer lag, scoring latency, DLQ rate, and publish
+failures are all invisible. Consumer lag is the one that matters most — it is
+the only signal that the consumer group has fallen behind ingestion, and the
+scaling story depends on being able to see it.
+
+*Model traceability, previously part of this item, is now done:* artifacts
+carry a git-sha version, `model_version` is stamped on every score message,
+and the consumer logs the version and training metrics at startup.
 
 ---
 
 ## Also unresolved (not code)
 
-`data/creditcard.csv` and `src/model/artifacts/model.joblib` are both absent,
-so `load_model()` raises at consumer startup and the stack cannot run
-end-to-end. None of the Kafka work above has been exercised against a real
-broker for that reason — it is covered by mock-based unit tests only. Worth a
-`docker-compose up` against the real dataset before trusting any of it.
+`data/creditcard.csv` is absent, so no real `model.joblib` has been produced
+and `load_model()` raises at consumer startup. The training and inference path
+is verified end-to-end against a synthetic dataset in `tests/test_train.py`,
+but every metric quoted from it is a wiring check, not a claim about
+real-world accuracy — the reported threshold, precision, and recall are all
+meaningless until training runs on the Kaggle data.
+
+The Kafka work likewise has never run against a real broker; it is covered by
+mock-based unit tests only. Worth a `docker-compose up` against the real
+dataset before trusting any of it.

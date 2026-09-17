@@ -10,32 +10,22 @@ import pytest
 from src import config
 from src.consumer.score_consumer import _handle_message, _parse
 from src.inference import predict
+from tests.test_inference import make_artifact
 
 
 class TestConsumerScoring:
     def test_predict_returns_expected_keys(self):
-        model = MagicMock()
-        model.decision_function.return_value = np.array([0.5])
-        model.predict.return_value = np.array([1])
-
-        result = predict(model, [0.1] * 29)
+        result = predict(make_artifact(0.5), [0.1] * 29)
         assert "is_fraud" in result
         assert "score" in result
+        assert "model_version" in result
 
-    def test_fraud_flagged_on_negative_prediction(self):
-        model = MagicMock()
-        model.decision_function.return_value = np.array([-0.5])
-        model.predict.return_value = np.array([-1])
-
-        result = predict(model, [0.1] * 29)
+    def test_fraud_flagged_below_threshold(self):
+        result = predict(make_artifact(-0.5), [0.1] * 29)
         assert result["is_fraud"] is True
 
     def test_clean_transaction_not_flagged(self):
-        model = MagicMock()
-        model.decision_function.return_value = np.array([0.3])
-        model.predict.return_value = np.array([1])
-
-        result = predict(model, [0.1] * 29)
+        result = predict(make_artifact(0.3), [0.1] * 29)
         assert result["is_fraud"] is False
 
 
@@ -73,10 +63,7 @@ class TestParse:
 
 class TestHandleMessage:
     def _model(self):
-        model = MagicMock()
-        model.decision_function.return_value = np.array([0.5])
-        model.predict.return_value = np.array([1])
-        return model
+        return make_artifact(0.5)
 
     def _producer(self):
         producer = MagicMock()
@@ -94,6 +81,14 @@ class TestHandleMessage:
         assert args[0] == config.KAFKA_SCORES_TOPIC
         assert kwargs["key"] == "txn-1"
         assert kwargs["value"]["transaction_id"] == "txn-1"
+
+    def test_model_version_travels_on_the_score_message(self):
+        producer = self._producer()
+        raw = json.dumps({"transaction_id": "txn-1", "features": [0.1] * 29}).encode()
+
+        _handle_message(self._model(), producer, raw)
+
+        assert producer.send.call_args.kwargs["value"]["model_version"] == "test-version"
 
     def test_result_is_json_serializable(self):
         """Regression: numpy bool_ from predict() broke json.dumps."""
@@ -114,7 +109,7 @@ class TestHandleMessage:
     def test_scoring_failure_is_dead_lettered(self):
         producer = self._producer()
         model = self._model()
-        model.predict.side_effect = ValueError("feature mismatch")
+        model["pipeline"].decision_function.side_effect = ValueError("feature mismatch")
         raw = json.dumps({"transaction_id": "txn-1", "features": [0.1] * 29}).encode()
 
         _handle_message(model, producer, raw)
