@@ -6,3 +6,4 @@ pandas
 kafka-python
 python-dotenv
 pydantic
+psycopg[binary,pool]

@@ -1,6 +1,8 @@
 """Pydantic request/response models."""
 from __future__ import annotations
 
+from datetime import datetime
+
 from pydantic import BaseModel, Field
 
 from src import config
@@ -22,3 +24,14 @@ class IngestResponse(BaseModel):
 
     transaction_id: str
     status: str
+
+
+class ScoreResponse(BaseModel):
+    """A completed fraud score."""
+
+    transaction_id: str
+    status: str = "scored"
+    is_fraud: bool
+    score: float
+    model_version: str
+    scored_at: datetime

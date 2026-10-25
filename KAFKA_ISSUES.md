@@ -6,28 +6,12 @@ done; what follows is what was consciously left for later.
 
 ---
 
-## 1. Nothing consumes `fraud-scores` — there is no read path
+## ~~1. Nothing consumes `fraud-scores`~~ — done 2026-10-18
 
-**Priority: high.** This is the largest remaining gap.
-
-The pipeline terminates in a topic with no consumer. A client posts to
-`/ingest`, receives a `transaction_id`, and has no way — ever — to learn
-whether the transaction was flagged. There is no status endpoint, no result
-store, and no push to a downstream service. Half the system is missing, and
-neither `PLANNING.md` nor `README.md` acknowledges it.
-
-This is a design decision before it is a code change. Two shapes:
-
-- **Pull.** A results consumer reads `fraud-scores` and writes to Redis or
-  Postgres keyed by `transaction_id`; the API grows a
-  `GET /transactions/{id}` returning `pending` until a score lands. Simplest,
-  and it gives the caller a story that matches the ID they already hold.
-- **Push.** Scores are forwarded to a downstream service or webhook, and the
-  API never serves results at all. Fewer moving parts, but callers need an
-  out-of-band way to correlate.
-
-Whichever is chosen, the store must dedupe on `transaction_id` — the consumer
-is at-least-once, so duplicate scores are expected, not exceptional.
+Results consumer persists scores to Postgres (upsert on `transaction_id`);
+`GET /transactions/{id}` and `GET /transactions` serve them. Verified on the
+live stack, including no loss and no duplicates across a SIGKILL of the
+scoring consumer mid-stream.
 
 ---
 
@@ -64,15 +48,16 @@ and the consumer logs the version and training metrics at startup.
 
 ---
 
-## Also unresolved (not code)
+## Verification status
 
-`data/creditcard.csv` is absent, so no real `model.joblib` has been produced
-and `load_model()` raises at consumer startup. The training and inference path
-is verified end-to-end against a synthetic dataset in `tests/test_train.py`,
-but every metric quoted from it is a wiring check, not a claim about
-real-world accuracy — the reported threshold, precision, and recall are all
-meaningless until training runs on the Kaggle data.
+The full pipeline has been run against real Kafka and Postgres via
+`docker compose`: end-to-end scoring, poison messages dead-lettered without
+crashing the consumer, at-least-once delivery across a SIGKILL (302/302
+transactions persisted, 8 redeliveries absorbed by the upsert), and clean
+SIGTERM shutdown of both consumers. That run caught three bugs the mocks
+could not: a YAML folding error that broke topic creation, and two SQL bugs
+in the store. `tests/test_store.py` now exercises the store against real
+Postgres when one is reachable.
 
-The Kafka work likewise has never run against a real broker; it is covered by
-mock-based unit tests only. Worth a `docker-compose up` against the real
-dataset before trusting any of it.
+Not yet tested: multiple scoring-consumer replicas rebalancing partitions,
+and behaviour under sustained load.

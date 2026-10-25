@@ -18,3 +18,14 @@ EXPECTED_FEATURE_COUNT = int(os.getenv("EXPECTED_FEATURE_COUNT", "29"))
 
 # How long /ingest waits for the broker to acknowledge a write before giving up.
 PRODUCER_ACK_TIMEOUT_SECONDS = float(os.getenv("PRODUCER_ACK_TIMEOUT_SECONDS", "5"))
+
+# Score store. Read by the results consumer and the read API; deliberately not
+# touched by /ingest, so ingestion stays dependent on Kafka alone.
+DATABASE_URL = os.getenv(
+    "DATABASE_URL", "postgresql://fraud:fraud@localhost:5432/fraud"
+)
+DB_POOL_MAX_SIZE = int(os.getenv("DB_POOL_MAX_SIZE", "10"))
+DB_CONNECT_TIMEOUT_SECONDS = float(os.getenv("DB_CONNECT_TIMEOUT_SECONDS", "10"))
+
+# Cap on rows returned by the flagged-transactions listing.
+MAX_LIST_LIMIT = int(os.getenv("MAX_LIST_LIMIT", "1000"))

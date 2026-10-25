@@ -4,7 +4,7 @@ A fraud detection API backed by Apache Kafka for high-throughput transaction ing
 
 ## Architecture
 
-Client → FastAPI `/ingest` → Kafka `transactions` topic → Consumer scores with model → Kafka `fraud-scores` topic
+Client → FastAPI `/ingest` → Kafka `transactions` → scoring consumer → Kafka `fraud-scores` → results consumer → Postgres ← `GET /transactions/{id}`
 
 The API never blocks on inference. It accepts and enqueues. Kafka absorbs traffic spikes. Consumers scale independently.
 
@@ -12,8 +12,9 @@ The API never blocks on inference. It accepts and enqueues. Kafka absorbs traffi
 
 ```bash
 pip install -r requirements-dev.txt
-python -m src.model.train          # requires data/creditcard.csv
-docker-compose up -d               # kafka + topic creation + api + consumer
+python -m src.model.fetch_data     # public dataset; no Kaggle key needed
+python -m src.model.train
+docker compose up -d --build       # kafka, topics, postgres, api, both consumers
 ```
 
 To run the API and consumer on the host instead of in containers, keep
@@ -24,8 +25,25 @@ uvicorn src.api.main:app --reload
 python -m src.consumer.score_consumer  # in a separate terminal
 ```
 
-Compose overrides that variable to `kafka:29092`, since `localhost` inside a
-container is the container itself.
+Compose overrides that variable to `kafka:29092`, and `DATABASE_URL` to the
+`postgres` service, since `localhost` inside a container is the container itself.
+
+## API
+
+| Method | Path | |
+|---|---|---|
+| `POST` | `/ingest` | Enqueue a transaction; returns `transaction_id` once the broker acks |
+| `GET` | `/transactions/{id}` | The score, or 404 while still in flight |
+| `GET` | `/transactions?since=&limit=` | Flagged transactions, newest first |
+
+A 404 from `GET /transactions/{id}` means "still in flight *or* unknown" —
+the two are deliberately indistinguishable. Writing a pending row at ingest
+would put Postgres on the ingest hot path, so a database outage would stop
+ingestion. Clients poll until the score appears; typical latency is well
+under a second.
+
+Scores are persisted by a separate results consumer, so a database stall
+backs up `fraud-scores` rather than stopping scoring.
 
 ## Model
 
@@ -47,9 +65,22 @@ Training prints **average precision** alongside precision and recall at the
 chosen threshold. Watch average precision, not ROC-AUC: at a ~0.17% positive
 rate, ROC-AUC looks flattering and says little about review workload.
 
-By default the model is fitted on labelled-clean rows only, making it a
-novelty detector and keeping every fraud available for scoring. `--fit-on-all`
-fits on everything instead; compare average precision between the two.
+The model is fitted on all training rows. Fitting on labelled-clean rows
+only (`--fit-on-normals`) scored worse on the Kaggle data in every one of five
+seeds — mean average precision 0.140 vs 0.188 — so it is kept only for
+comparison.
+
+Current numbers on the 30% held-out split (148 frauds in 85,443 rows):
+
+| Alert rate | Alerts | Precision | Recall |
+|---|---|---|---|
+| 0.1% | 86 | 0.35 | 0.20 |
+| 0.5% (default) | 428 | 0.17 | 0.49 |
+| 1.0% | 855 | 0.11 | 0.64 |
+| 2.0% | 1,709 | 0.07 | 0.75 |
+
+Average precision is 0.186. At the default budget, about one alert in six is
+real fraud and half of all fraud is caught.
 
 ### Feature contract
 
