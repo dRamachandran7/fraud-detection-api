@@ -9,17 +9,33 @@ from __future__ import annotations
 import json
 import logging
 import signal
+import time
 from types import FrameType
 
 from kafka import KafkaConsumer
+from kafka.consumer.fetcher import ConsumerRecord
+from prometheus_client import Counter, Histogram
 
 from src import config
+from src.consumer.batching import commit_batch, rewind
+from src.metrics import LagReporter, start_metrics_server
 from src.store import scores as store
 
 logger = logging.getLogger(__name__)
 
+GROUP_ID = "score-persister"
 POLL_TIMEOUT_MS = 1000
+FAILURE_BACKOFF_SECONDS = 1.0
 REQUIRED_FIELDS = ("transaction_id", "is_fraud", "score", "model_version")
+
+PERSISTED = Counter("fraud_scores_persisted_total", "Scores written to the store")
+SKIPPED = Counter(
+    "fraud_scores_skipped_total", "Unusable score messages (a bug upstream if nonzero)"
+)
+BATCH_FAILURES = Counter(
+    "fraud_persist_batch_failures_total", "Batches left uncommitted for redelivery"
+)
+DB_WRITE_SECONDS = Histogram("fraud_db_write_seconds", "Time per batched upsert")
 
 _shutdown = False
 
@@ -41,10 +57,12 @@ def _build_consumer() -> KafkaConsumer:
         bootstrap_servers=config.KAFKA_BOOTSTRAP_SERVERS,
         value_deserializer=None,
         auto_offset_reset="earliest",
-        group_id="score-persister",
+        group_id=GROUP_ID,
         # Commit only after the write lands, so a crash replays rather than
         # silently dropping a score. Upserts make the replay harmless.
         enable_auto_commit=False,
+        session_timeout_ms=config.KAFKA_SESSION_TIMEOUT_MS,
+        heartbeat_interval_ms=config.KAFKA_HEARTBEAT_INTERVAL_MS,
     )
 
 
@@ -65,51 +83,68 @@ def _parse(raw: bytes) -> dict:
     return event
 
 
-def _handle_message(raw: bytes) -> None:
-    """Persist one score. Malformed messages are logged and skipped.
+def _process_batch(messages: list[ConsumerRecord]) -> None:
+    """Persist a polled batch in one transaction. Malformed messages are skipped.
 
     Database errors are left to propagate: unlike a bad message, they are
-    transient, and the batch should go uncommitted so the score is retried.
+    transient, and the batch should be rewound so every score is retried.
     """
-    try:
-        event = _parse(raw)
-    except ValueError as exc:
-        # No DLQ here: these messages came from our own scoring consumer, so a
-        # malformed one is a bug on our side worth alerting on, not client input.
-        logger.error("Unusable score message, skipping: %s", exc)
+    rows = []
+    for message in messages:
+        try:
+            event = _parse(message.value)
+        except ValueError as exc:
+            # No DLQ here: these messages came from our own scoring consumer, so
+            # a malformed one is a bug on our side worth alerting on, not client
+            # input. SKIPPED makes it visible.
+            SKIPPED.inc()
+            logger.error("Unusable score message, skipping: %s", exc)
+            continue
+        rows.append(
+            {
+                "transaction_id": event["transaction_id"],
+                "is_fraud": bool(event["is_fraud"]),
+                "score": float(event["score"]),
+                "model_version": event["model_version"],
+            }
+        )
+
+    if not rows:
         return
 
-    store.save_score(
-        transaction_id=event["transaction_id"],
-        is_fraud=bool(event["is_fraud"]),
-        score=float(event["score"]),
-        model_version=event["model_version"],
-    )
-    logger.debug("Persisted score for %s", event["transaction_id"])
+    started = time.perf_counter()
+    store.save_scores(rows)
+    DB_WRITE_SECONDS.observe(time.perf_counter() - started)
+    PERSISTED.inc(len(rows))
+    logger.info("Persisted %d scores", len(rows))
 
 
 def run_consumer() -> None:
     """Consume scored transactions and write them to the store."""
     _install_signal_handlers()
+    start_metrics_server()
 
     store.init_schema()
     consumer = _build_consumer()
+    lag = LagReporter(consumer, GROUP_ID)
 
     try:
         while not _shutdown:
+            lag.maybe_report()
             batches = consumer.poll(timeout_ms=POLL_TIMEOUT_MS)
             if not batches:
                 continue
 
             try:
-                for records in batches.values():
-                    for message in records:
-                        _handle_message(message.value)
-            except Exception as exc:
-                logger.exception("Failed to persist batch, not committing: %s", exc)
+                _process_batch([m for records in batches.values() for m in records])
+            except Exception:
+                BATCH_FAILURES.inc()
+                logger.exception("Failed to persist batch; rewinding")
+                rewind(consumer, batches)
+                time.sleep(FAILURE_BACKOFF_SECONDS)
                 continue
 
-            consumer.commit()
+            commit_batch(consumer)
     finally:
         consumer.close()
         store.close_pool()

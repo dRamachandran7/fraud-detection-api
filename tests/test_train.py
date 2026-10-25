@@ -41,7 +41,7 @@ class TestTrain:
         data_path, _ = dataset
         out = tmp_path / "model.joblib"
 
-        artifact = train(str(data_path), str(out), alert_rate=0.01)
+        artifact = train(str(data_path), str(out), alert_rate=0.01, cv_folds=0)
 
         assert out.exists()
         assert artifact["feature_order"] == FEATURE_ORDER
@@ -52,7 +52,7 @@ class TestTrain:
     def test_separable_fraud_is_detected(self, dataset, tmp_path):
         """Guards the pipeline wiring, not real-world accuracy."""
         data_path, _ = dataset
-        artifact = train(str(data_path), str(tmp_path / "m.joblib"), alert_rate=0.01)
+        artifact = train(str(data_path), str(tmp_path / "m.joblib"), alert_rate=0.01, cv_folds=0)
 
         assert artifact["metrics"]["average_precision"] > 0.5
         assert artifact["metrics"]["recall_at_threshold"] > 0.5
@@ -63,7 +63,7 @@ class TestTrain:
 
     def test_time_column_is_excluded_from_features(self, dataset, tmp_path):
         data_path, _ = dataset
-        artifact = train(str(data_path), str(tmp_path / "m.joblib"), alert_rate=0.01)
+        artifact = train(str(data_path), str(tmp_path / "m.joblib"), alert_rate=0.01, cv_folds=0)
         assert "Time" not in artifact["feature_order"]
 
 
@@ -72,7 +72,7 @@ class TestRoundTrip:
         """train -> joblib -> load_model -> predict, with no shape drift."""
         data_path, df = dataset
         out = tmp_path / "model.joblib"
-        train(str(data_path), str(out), alert_rate=0.01)
+        train(str(data_path), str(out), alert_rate=0.01, cv_folds=0)
 
         with patch("src.config.MODEL_PATH", str(out)):
             artifact = load_model()
@@ -94,3 +94,53 @@ class TestRoundTrip:
         with patch("src.config.MODEL_PATH", str(stale)):
             with pytest.raises(ArtifactError, match="Retrain"):
                 load_model()
+
+
+class TestHybrid:
+    def test_anomaly_score_is_a_classifier_input(self, dataset, tmp_path):
+        data_path, _ = dataset
+        artifact = train(str(data_path), str(tmp_path / "m.joblib"), alert_rate=0.01, cv_folds=0)
+
+        steps = dict(artifact["pipeline"].named_steps)
+        assert "anomaly_score" in steps
+        assert "anomaly_score" in steps["classifier"].feature_names_in_
+        assert artifact["score_type"] == "fraud_probability"
+
+    def test_supervised_only_omits_anomaly_score(self, dataset, tmp_path):
+        data_path, _ = dataset
+        artifact = train(
+            str(data_path), str(tmp_path / "m.joblib"), alert_rate=0.01,
+            include_anomaly_score=False, cv_folds=0,
+        )
+        assert "anomaly_score" not in artifact["pipeline"].named_steps
+        assert artifact["metrics"]["model"] == "supervised"
+
+    def test_artifact_with_unknown_score_type_is_rejected(self, dataset, tmp_path):
+        """An old Isolation-Forest-only artifact must not be thresholded as a probability."""
+        import joblib
+
+        data_path, _ = dataset
+        out = tmp_path / "m.joblib"
+        artifact = train(str(data_path), str(out), alert_rate=0.01, cv_folds=0)
+        artifact["score_type"] = "anomaly_decision_function"
+        joblib.dump(artifact, out)
+
+        with patch("src.config.MODEL_PATH", str(out)):
+            with pytest.raises(ArtifactError, match="score_type"):
+                load_model()
+
+
+class TestStrata:
+    def test_strata_combine_label_and_time_bucket(self):
+        from src.model.train import _strata
+
+        df = pd.DataFrame({"Time": [0, 3600 * 5, 3600 * 5], "Class": [0, 0, 1]})
+        assert list(_strata(df, bucket_hours=4)) == ["0_0", "1_0", "1_1"]
+
+    def test_artifact_records_cross_validation(self, dataset, tmp_path):
+        data_path, _ = dataset
+        artifact = train(str(data_path), str(tmp_path / "m.joblib"), alert_rate=0.01, cv_folds=3)
+
+        cv = artifact["metrics"]["cross_validation"]
+        assert cv["folds"] == 3
+        assert 0 <= cv["average_precision"]["mean"] <= 1

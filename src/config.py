@@ -29,3 +29,14 @@ DB_CONNECT_TIMEOUT_SECONDS = float(os.getenv("DB_CONNECT_TIMEOUT_SECONDS", "10")
 
 # Cap on rows returned by the flagged-transactions listing.
 MAX_LIST_LIMIT = int(os.getenv("MAX_LIST_LIMIT", "1000"))
+
+# Port for the consumers' Prometheus /metrics endpoint; 0 disables it. The API
+# serves /metrics on its own port instead.
+METRICS_PORT = int(os.getenv("METRICS_PORT", "9100"))
+
+# How long the group waits on a silent member before reassigning its
+# partitions. kafka-python's 45s default left a crashed replica's partitions
+# unprocessed for ~35s in a load test. Heartbeats run on a background thread,
+# so a slow batch cannot trip this; max.poll.interval guards the loop instead.
+KAFKA_SESSION_TIMEOUT_MS = int(os.getenv("KAFKA_SESSION_TIMEOUT_MS", "10000"))
+KAFKA_HEARTBEAT_INTERVAL_MS = int(os.getenv("KAFKA_HEARTBEAT_INTERVAL_MS", "3000"))

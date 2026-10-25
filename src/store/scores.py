@@ -46,6 +46,42 @@ def init_schema() -> None:
     logger.info("Score store schema ready")
 
 
+UPSERT_SQL = """
+    INSERT INTO fraud_scores
+        (transaction_id, is_fraud, score, model_version, scored_at)
+    VALUES (%s, %s, %s, %s, COALESCE(%s, now()))
+    ON CONFLICT (transaction_id) DO UPDATE SET
+        is_fraud      = EXCLUDED.is_fraud,
+        score         = EXCLUDED.score,
+        model_version = EXCLUDED.model_version,
+        scored_at     = EXCLUDED.scored_at
+"""
+
+
+def save_scores(scores: list[dict[str, Any]]) -> None:
+    """Upsert many scores in one transaction: all land, or none do.
+
+    Idempotent on transaction_id: redelivery from the at-least-once consumers
+    overwrites rather than duplicating. A rescore under a newer model version
+    legitimately replaces the old verdict.
+    """
+    if not scores:
+        return
+    params = [
+        (
+            s["transaction_id"],
+            s["is_fraud"],
+            s["score"],
+            s["model_version"],
+            s.get("scored_at"),
+        )
+        for s in scores
+    ]
+    with get_pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.executemany(UPSERT_SQL, params)
+
+
 def save_score(
     transaction_id: str,
     is_fraud: bool,
@@ -53,26 +89,18 @@ def save_score(
     model_version: str,
     scored_at: datetime | None = None,
 ) -> None:
-    """Upsert one score.
-
-    Idempotent on transaction_id: redelivery from the at-least-once scoring
-    consumer overwrites rather than duplicating. A rescore under a newer model
-    version legitimately replaces the old verdict.
-    """
-    with get_pool().connection() as conn:
-        conn.execute(
-            """
-            INSERT INTO fraud_scores
-                (transaction_id, is_fraud, score, model_version, scored_at)
-            VALUES (%s, %s, %s, %s, COALESCE(%s, now()))
-            ON CONFLICT (transaction_id) DO UPDATE SET
-                is_fraud      = EXCLUDED.is_fraud,
-                score         = EXCLUDED.score,
-                model_version = EXCLUDED.model_version,
-                scored_at     = EXCLUDED.scored_at
-            """,
-            (transaction_id, is_fraud, score, model_version, scored_at),
-        )
+    """Upsert one score. See save_scores."""
+    save_scores(
+        [
+            {
+                "transaction_id": transaction_id,
+                "is_fraud": is_fraud,
+                "score": score,
+                "model_version": model_version,
+                "scored_at": scored_at,
+            }
+        ]
+    )
 
 
 def get_score(transaction_id: str) -> dict[str, Any] | None:

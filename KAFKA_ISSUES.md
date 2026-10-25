@@ -1,63 +1,68 @@
-# Open Kafka Issues
+# Kafka Issues
 
-Deferred items from the 2026-09-13 review of the producer and consumer. The
-blockers, producer durability, and consumer at-least-once work are already
-done; what follows is what was consciously left for later.
-
----
-
-## ~~1. Nothing consumes `fraud-scores`~~ — done 2026-10-18
-
-Results consumer persists scores to Postgres (upsert on `transaction_id`);
-`GET /transactions/{id}` and `GET /transactions` serve them. Verified on the
-live stack, including no loss and no duplicates across a SIGKILL of the
-scoring consumer mid-stream.
+Tracking file from the 2026-09-13 review of the producer and consumers. Every
+item from that review is resolved; the few open items at the bottom were found
+while closing them out.
 
 ---
 
-## 2. Scoring is one row at a time
+## Resolved
 
-**Priority: medium.** Cheap throughput win, low risk.
+**Nothing consumed `fraud-scores`** (2026-10-18). A results consumer persists
+scores to Postgres; `GET /transactions/{id}` and `GET /transactions` serve
+them.
 
-`_handle_message` reshapes a single transaction into `(1, 29)` and calls
-`predict` per message. The consumer already uses `poll()`, so records arrive
-in batches — stacking a batch into one array and calling
-`model.predict` / `model.decision_function` once would cut per-row sklearn
-overhead substantially.
+**Scoring was one row at a time** (2026-10-25). Both consumers now process a
+polled batch as a unit: one model call per batch in the scoring consumer, one
+transaction per batch in the results consumer, and all score sends issued
+before waiting on their acks. Measured locally: ~8x cheaper per transaction at
+the ~10-message batches seen under steady load, ~290x at a full 500-message
+batch. Batches grow on their own when a backlog builds, which is when it
+matters. If the batch model call fails, the consumer retries row by row so one
+bad row is dead-lettered instead of the batch.
 
-Care required on two points: the DLQ path is per-message, so unparseable
-records have to be filtered out of the batch before stacking and dead-lettered
-individually; and results must be zipped back to their `transaction_id` in
-order. Keep the commit boundary where it is — after the whole batch is
-published.
+**No observability** (2026-10-25). Prometheus metrics on the API (`/metrics`)
+and both consumers (`:9100/metrics`), scraped by a `prometheus` service on
+`localhost:9090`. Consumer lag per partition is the headline metric:
+`sum by (group) (fraud_consumer_lag_messages)`. Also: scored/flagged counts,
+DLQ count by reason, batch size, model time, DB write time, batch failures,
+ingest publish latency, HTTP requests by route and status.
+
+**Failed batches were silently lost** (2026-10-25, found during this work). On
+a failed batch both consumers skipped the commit, but `poll()` had already
+moved the read position past it, so the next successful commit skipped the
+failed messages for good. Both now seek back to the start of a failed batch.
+A commit that fails after a rebalance no longer crashes the process.
+
+**Untested under replicas and load** (2026-10-25). `scripts/load_test.py`
+sends real transactions through `/ingest` and checks Postgres that every
+acknowledged one was persisted. Results with 3 scoring replicas, 5,000
+transactions at concurrency 32:
+
+| Scenario | Acked | Persisted | End to end |
+|---|---|---|---|
+| Steady load | 5000 | 5000 | 15.1s |
+| One replica SIGKILLed mid-run | 5000 | 5000 | 15.5s |
+| Postgres stopped for 10s mid-run | 5000 | 5000 | 21.5s |
+
+The replica-kill run first took 50.5s: kafka-python's 45s default session
+timeout left the dead replica's partitions idle for ~35s. Lowered to 10s
+(`KAFKA_SESSION_TIMEOUT_MS`).
+
+**Serializer deprecation warning** (2026-10-25). Replaced lambda serializers
+with `kafka.serializer.Serializer` subclasses; `kafka-python` pinned.
 
 ---
 
-## 3. No observability
+## Open
 
-**Priority: medium.**
-
-No metrics of any kind: consumer lag, scoring latency, DLQ rate, and publish
-failures are all invisible. Consumer lag is the one that matters most — it is
-the only signal that the consumer group has fallen behind ingestion, and the
-scaling story depends on being able to see it.
-
-*Model traceability, previously part of this item, is now done:* artifacts
-carry a git-sha version, `model_version` is stamped on every score message,
-and the consumer logs the version and training metrics at startup.
-
----
-
-## Verification status
-
-The full pipeline has been run against real Kafka and Postgres via
-`docker compose`: end-to-end scoring, poison messages dead-lettered without
-crashing the consumer, at-least-once delivery across a SIGKILL (302/302
-transactions persisted, 8 redeliveries absorbed by the upsert), and clean
-SIGTERM shutdown of both consumers. That run caught three bugs the mocks
-could not: a YAML folding error that broke topic creation, and two SQL bugs
-in the store. `tests/test_store.py` now exercises the store against real
-Postgres when one is reachable.
-
-Not yet tested: multiple scoring-consumer replicas rebalancing partitions,
-and behaviour under sustained load.
+- **Ingest throughput tops out around 350–400 req/s** on the single API
+  process. Scoring keeps up with that easily, so the API is the bottleneck.
+  The likely limit is each request blocking on its broker ack with
+  `max_in_flight_requests_per_connection=1`. Not a problem at current volume;
+  more uvicorn workers or API replicas are the first step if it becomes one.
+- **Nothing alerts.** Prometheus collects the metrics but no rule fires on
+  rising lag, DLQ growth, or batch failures.
+- **The restart policy is unverified.** Consumers have
+  `restart: unless-stopped`, but the kill test used `docker kill`, which
+  Docker treats as a manual stop, so automatic restart was not exercised.

@@ -45,42 +45,81 @@ under a second.
 Scores are persisted by a separate results consumer, so a database stall
 backs up `fraud-scores` rather than stopping scoring.
 
+## Operations
+
+**Scaling.** Scoring consumers scale horizontally up to the partition count
+(6): `docker compose up -d --scale consumer=3`. Each replica owns a share of
+the partitions; when one dies, the rest take over its partitions within
+~10 seconds (`KAFKA_SESSION_TIMEOUT_MS`).
+
+**Metrics.** Prometheus runs at `localhost:9090` and scrapes the API and every
+consumer replica. The number to watch is consumer lag:
+
+```
+sum by (group) (fraud_consumer_lag_messages)
+```
+
+Lag that keeps rising means ingestion is outpacing scoring: add replicas.
+
+**Load test.** `python -m scripts.load_test --total 5000 --concurrency 32`
+drives `/ingest` with real transactions and checks Postgres that every
+acknowledged one was persisted. Current results are in `KAFKA_ISSUES.md`.
+
 ## Model
 
-Isolation Forest, trained unsupervised. The labels are never passed to `fit`,
-but they are used to evaluate and to choose the decision threshold — an
-unvalidated anomaly detector is not worth deploying.
+A hybrid: a gradient-boosted classifier (`HistGradientBoostingClassifier`)
+trained on the fraud labels, with an Isolation Forest anomaly score added as
+one more input feature. `score` in the API is the classifier's probability of
+fraud, 0 to 1.
 
 ```bash
 python -m src.model.train --alert-rate 0.005
+python -m src.model.train --no-anomaly-score   # supervised only, for comparison
 ```
 
 `--alert-rate` is an **alert budget**, not an estimate of the fraud rate: it is
 the share of traffic to flag, and should come from how many reviews the team
 can absorb. The threshold is set at that percentile of held-out scores, and
-`is_fraud` compares against it. Do not rely on sklearn's `.predict()` here —
-its boundary comes from `contamination` and is not tuned to that budget.
+`is_fraud` compares against it — not against 0.5.
 
 Training prints **average precision** alongside precision and recall at the
 chosen threshold. Watch average precision, not ROC-AUC: at a ~0.17% positive
 rate, ROC-AUC looks flattering and says little about review workload.
 
-The model is fitted on all training rows. Fitting on labelled-clean rows
-only (`--fit-on-normals`) scored worse on the Kaggle data in every one of five
-seeds — mean average precision 0.140 vs 0.188 — so it is kept only for
-comparison.
+Splits are stratified on label x 4-hour time bucket, not label alone: the
+fraud rate swings ~8x across the dataset's 48 hours (overnight hours carry the
+most), so a label-only split can over- or under-sample the night. Training
+also runs 5-fold cross-validation, because a single holdout's average
+precision moves by several points with the split alone, and a time-forward
+check (fit on the first 24h, test on the last 24h).
 
-Current numbers on the 30% held-out split (148 frauds in 85,443 rows):
+Current numbers:
 
-| Alert rate | Alerts | Precision | Recall |
-|---|---|---|---|
-| 0.1% | 86 | 0.35 | 0.20 |
-| 0.5% (default) | 428 | 0.17 | 0.49 |
-| 1.0% | 855 | 0.11 | 0.64 |
-| 2.0% | 1,709 | 0.07 | 0.75 |
+| | CV avg precision | CV recall @ 0.5% | Time-forward avg precision | Time-forward recall @ 0.5% |
+|---|---|---|---|---|
+| Hybrid (shipped) | 0.694 +/- 0.042 | 0.799 | 0.349 | 0.630 |
+| Supervised only | 0.691 +/- 0.028 | 0.797 | 0.303 | 0.673 |
+| Isolation Forest only (previous model) | 0.178 +/- 0.036 | 0.451 | 0.114 | 0.313 |
 
-Average precision is 0.186. At the default budget, about one alert in six is
-real fraud and half of all fraud is caught.
+On this dataset the anomaly score adds nothing measurable over supervised
+only. It is kept as a hedge for fraud patterns the labels do not contain,
+which labelled data from the same two days cannot test.
+
+Precision at a fixed alert rate is capped by the base rate: fraud is ~0.17%
+of traffic, so flagging 0.5% can never exceed ~35% precision. The
+time-forward numbers are the closest to production conditions; expect
+real-world results nearer them than the CV means.
+
+Why the Isolation Forest alone underperforms: fraud *is* unusual (84% of
+frauds rank in the most anomalous 5% of transactions), but most unusual
+transactions are not fraud. At the 0.5% budget, 370 of its 428 alerts were
+legitimate, typically large purchases (median $118 vs $10 for fraud). The
+fraud signal is concentrated in a few features (V17, V14, V12, V10), while the
+forest picks split features at random and weighs every kind of unusual
+equally. The labels tell the classifier which kind matters.
+
+`scikit-learn` is pinned in `requirements.txt`: the artifact is a pickle and
+must be loaded with the version that trained it.
 
 ### Feature contract
 

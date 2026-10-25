@@ -1,9 +1,10 @@
 fastapi
 uvicorn
-scikit-learn
+scikit-learn==1.9.1  # pinned: the model artifact is a pickle and must load with the version that trained it
 joblib
 pandas
-kafka-python
+kafka-python==3.0.11  # pinned: 3.x changed the serializer interface
 python-dotenv
 pydantic
 psycopg[binary,pool]
+prometheus-client

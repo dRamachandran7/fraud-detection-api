@@ -1,15 +1,25 @@
 """Publishes raw transactions to Kafka for async scoring."""
 from __future__ import annotations
 
-import json
 import logging
 import threading
+import time
 import uuid
 
+from prometheus_client import Histogram
+
 from src import config
+from src.kafka_serde import JsonSerializer, StringSerializer
 from src.api.schemas import IngestRequest
 
 logger = logging.getLogger(__name__)
+
+
+PUBLISH_SECONDS = Histogram(
+    "fraud_ingest_publish_seconds",
+    "Time from send to broker ack on /ingest, by outcome",
+    ["outcome"],
+)
 
 
 class PublishError(RuntimeError):
@@ -25,8 +35,8 @@ def _build_producer():
 
     return KafkaProducer(
         bootstrap_servers=config.KAFKA_BOOTSTRAP_SERVERS,
-        value_serializer=lambda v: json.dumps(v).encode("utf-8"),
-        key_serializer=lambda k: k.encode("utf-8") if k is not None else None,
+        value_serializer=JsonSerializer(),
+        key_serializer=StringSerializer(),
         # Durability: a transaction we have already acknowledged to the caller
         # must not be lost to a leader election or a transient broker error.
         acks="all",
@@ -63,6 +73,7 @@ def publish_transaction(request: IngestRequest) -> str:
 
     from kafka.errors import KafkaError
 
+    started = time.perf_counter()
     try:
         future = _get_producer().send(
             config.KAFKA_INGEST_TOPIC,
@@ -71,8 +82,10 @@ def publish_transaction(request: IngestRequest) -> str:
         )
         future.get(timeout=config.PRODUCER_ACK_TIMEOUT_SECONDS)
     except KafkaError as exc:
+        PUBLISH_SECONDS.labels("failed").observe(time.perf_counter() - started)
         logger.error("Failed to publish transaction %s: %s", transaction_id, exc)
         raise PublishError(str(exc)) from exc
+    PUBLISH_SECONDS.labels("acked").observe(time.perf_counter() - started)
 
     return transaction_id
 

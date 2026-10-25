@@ -32,17 +32,18 @@ def preprocess(df: pd.DataFrame) -> pd.DataFrame:
     return df[FEATURE_ORDER]
 
 
-def features_to_frame(features: list[float]) -> pd.DataFrame:
-    """Build a one-row frame from an ordered feature vector, as sent to /ingest.
+def features_to_frame(rows: list[list[float]]) -> pd.DataFrame:
+    """Build a frame from ordered feature vectors, as sent to /ingest.
 
-    Callers send a bare list, so the ordering contract is positional. This is
+    Callers send bare lists, so the ordering contract is positional. This is
     the single place that contract is applied.
 
     Raises:
-        ValueError: if the vector length does not match FEATURE_ORDER.
+        ValueError: if any vector's length does not match FEATURE_ORDER.
     """
-    if len(features) != len(FEATURE_ORDER):
-        raise ValueError(
-            f"expected {len(FEATURE_ORDER)} features, got {len(features)}"
-        )
-    return pd.DataFrame([features], columns=FEATURE_ORDER)
+    for row in rows:
+        if len(row) != len(FEATURE_ORDER):
+            raise ValueError(
+                f"expected {len(FEATURE_ORDER)} features, got {len(row)}"
+            )
+    return pd.DataFrame(rows, columns=FEATURE_ORDER)

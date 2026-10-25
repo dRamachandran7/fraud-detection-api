@@ -59,6 +59,7 @@ services:
 
   api:
     build: .
+    restart: unless-stopped
     ports:
       - "8000:8000"
     depends_on:
@@ -73,8 +74,13 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       DATABASE_URL: postgresql://fraud:fraud@postgres:5432/fraud
 
+  # Scales horizontally up to the partition count (6):
+  #   docker compose up -d --scale consumer=3
+  # No host port for metrics, so replicas do not collide; Prometheus scrapes
+  # them on the internal network.
   consumer:
     build: .
+    restart: unless-stopped
     command: python -m src.consumer.score_consumer
     depends_on:
       topic-init:
@@ -87,6 +93,7 @@ services:
   # Separate from the scoring consumer: a database stall must not stop scoring.
   results-consumer:
     build: .
+    restart: unless-stopped
     command: python -m src.consumer.results_consumer
     depends_on:
       topic-init:
@@ -98,6 +105,17 @@ services:
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       DATABASE_URL: postgresql://fraud:fraud@postgres:5432/fraud
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./ops/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      - api
+      - consumer
+      - results-consumer
 
 volumes:
   postgres-data:

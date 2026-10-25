@@ -1,4 +1,10 @@
-"""Train an Isolation Forest model and serialize it as a versioned artifact."""
+"""Train the hybrid fraud model and serialize it as a versioned artifact.
+
+Hybrid: a gradient-boosted classifier trained on the fraud labels, with an
+Isolation Forest anomaly score added as one more input feature. The classifier
+learns which fraud patterns the labels show; the anomaly score gives it a
+signal for transactions that are unusual in ways the labels may not cover.
+"""
 from __future__ import annotations
 
 import argparse
@@ -9,13 +15,12 @@ from pathlib import Path
 import joblib
 import numpy as np
 import pandas as pd
-from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import IsolationForest
+from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.metrics import average_precision_score, roc_auc_score
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import FunctionTransformer
 
+from src.model.features import AnomalyScoreFeature
 from src.model.preprocess import FEATURE_ORDER, LABEL_COLUMN, preprocess
 
 DEFAULT_DATA_PATH = "data/creditcard.csv"
@@ -23,42 +28,127 @@ DEFAULT_OUTPUT_PATH = "src/model/artifacts/model.joblib"
 
 # Share of scored traffic to flag. This is an alert budget, not an estimate of
 # the fraud rate: it should reflect how many reviews per day the team can
-# actually absorb. The dataset's true positive rate is ~0.17%.
+# actually absorb. The dataset's true positive rate is ~0.17%, so precision at
+# this budget can never exceed ~35%.
 DEFAULT_ALERT_RATE = 0.005
 
+# Splits are stratified on label x time bucket, not label alone. The fraud rate
+# swings ~8x across the dataset's 48 hours (0.07% to 0.57% per 4h bucket, with
+# low-traffic overnight hours carrying the most fraud), so a label-only split
+# can over- or under-sample the night and move the measured precision.
+TIME_COLUMN = "Time"
+DEFAULT_TIME_BUCKET_HOURS = 4
+DEFAULT_CV_FOLDS = 5
 
-def _build_pipeline(contamination: float, random_state: int) -> Pipeline:
-    """Transforms live inside the pipeline so they serialize with the model.
+# Inference reads this to know how to interpret `score` and the threshold.
+SCORE_TYPE = "fraud_probability"
 
-    Isolation Forest draws splits uniformly between a feature's min and max, so
-    it is scale-invariant per feature but not skew-invariant. Raw `Amount`
-    spans four orders of magnitude, which lets a single large-but-legitimate
-    purchase be isolated in one or two splits and dominate the score. Fraud in
-    this dataset skews toward small amounts, so that bias runs backwards;
-    log1p compresses the tail.
+
+def build_pipeline(random_state: int, include_anomaly_score: bool = True) -> Pipeline:
+    """The shipped model. `include_anomaly_score=False` is supervised-only.
+
+    No class weighting: it would distort predict_proba, which is served as a
+    probability. Ranking — all the alert-budget threshold needs — is fine
+    without it.
     """
-    return Pipeline(
-        [
-            (
-                "amount_log",
-                ColumnTransformer(
-                    [("log", FunctionTransformer(np.log1p), ["Amount"])],
-                    remainder="passthrough",
-                    verbose_feature_names_out=False,
-                ),
+    steps = []
+    if include_anomaly_score:
+        steps.append(("anomaly_score", AnomalyScoreFeature(random_state=random_state)))
+    steps.append(
+        (
+            "classifier",
+            HistGradientBoostingClassifier(
+                max_iter=300, learning_rate=0.05, random_state=random_state
             ),
-            (
-                "iforest",
-                IsolationForest(
-                    n_estimators=200,
-                    max_samples=256,  # the iForest paper's recommendation
-                    contamination=contamination,
-                    random_state=random_state,
-                    n_jobs=-1,
-                ),
-            ),
-        ]
+        )
     )
+    return Pipeline(steps)
+
+
+def fraud_scores(pipeline: Pipeline, X: pd.DataFrame) -> np.ndarray:
+    """Probability of fraud per row. Higher = more likely fraud."""
+    return pipeline.predict_proba(X)[:, 1]
+
+
+def _strata(df: pd.DataFrame, bucket_hours: int) -> np.ndarray:
+    """Label x time-bucket strata, so every split covers the whole timeline.
+
+    Time is used only to shape the split; it is never a model feature.
+    """
+    buckets = (df[TIME_COLUMN] // (bucket_hours * 3600)).astype(int)
+    return (buckets.astype(str) + "_" + df[LABEL_COLUMN].astype(str)).to_numpy()
+
+
+def _evaluate(scores: np.ndarray, y: np.ndarray, alert_rate: float) -> dict:
+    """Metrics for one scored split. Higher score = more likely fraud.
+
+    The threshold is a score percentile and never looks at labels, so choosing
+    it and measuring precision/recall on the same rows is not biased.
+    """
+    threshold = float(np.percentile(scores, 100 - alert_rate * 100))
+    flagged = scores >= threshold
+    n_flagged = int(flagged.sum())
+    n_fraud = int((y == 1).sum())
+    caught = int((flagged & (y == 1)).sum())
+    return {
+        "average_precision": float(average_precision_score(y, scores)),
+        "roc_auc": float(roc_auc_score(y, scores)),
+        "threshold": threshold,
+        "precision_at_threshold": caught / n_flagged if n_flagged else 0.0,
+        "recall_at_threshold": caught / n_fraud if n_fraud else 0.0,
+        "caught": caught,
+        "n_fraud": n_fraud,
+    }
+
+
+def _cross_validate(
+    X: pd.DataFrame,
+    y: np.ndarray,
+    strata: np.ndarray,
+    alert_rate: float,
+    folds: int,
+    include_anomaly_score: bool,
+    random_state: int,
+) -> dict:
+    """Mean and spread of the metrics across stratified folds.
+
+    A single holdout's average precision moves by several points with the
+    split alone, so one number is not enough to compare two configurations.
+    """
+    per_fold = []
+    splitter = StratifiedKFold(n_splits=folds, shuffle=True, random_state=random_state)
+    for train_idx, test_idx in splitter.split(X, strata):
+        pipeline = build_pipeline(random_state, include_anomaly_score)
+        pipeline.fit(X.iloc[train_idx], y[train_idx])
+        per_fold.append(
+            _evaluate(fraud_scores(pipeline, X.iloc[test_idx]), y[test_idx], alert_rate)
+        )
+
+    summary = {"folds": folds}
+    for key in ("average_precision", "roc_auc", "precision_at_threshold", "recall_at_threshold"):
+        values = [m[key] for m in per_fold]
+        summary[key] = {"mean": float(np.mean(values)), "std": float(np.std(values))}
+    return summary
+
+
+def _time_forward(
+    df: pd.DataFrame,
+    X: pd.DataFrame,
+    y: np.ndarray,
+    alert_rate: float,
+    include_anomaly_score: bool,
+    random_state: int,
+) -> dict:
+    """Fit on the first half of the timeline, test on the second.
+
+    The closest this dataset gets to production, where the model only ever
+    scores transactions from after it was trained. Expect it below the CV mean.
+    """
+    cutoff = df[TIME_COLUMN].max() / 2
+    past = (df[TIME_COLUMN] < cutoff).to_numpy()
+    pipeline = build_pipeline(random_state, include_anomaly_score)
+    pipeline.fit(X[past], y[past])
+    return _evaluate(fraud_scores(pipeline, X[~past]), y[~past], alert_rate)
 
 
 def _resolve_version() -> str:
@@ -80,15 +170,12 @@ def train(
     data_path: str = DEFAULT_DATA_PATH,
     output_path: str = DEFAULT_OUTPUT_PATH,
     alert_rate: float = DEFAULT_ALERT_RATE,
-    fit_on_normals_only: bool = False,
+    include_anomaly_score: bool = True,
     random_state: int = 42,
+    time_bucket_hours: int = DEFAULT_TIME_BUCKET_HOURS,
+    cv_folds: int = DEFAULT_CV_FOLDS,
 ) -> dict:
-    """Fit, evaluate against the labels, pick a threshold, and serialize.
-
-    Isolation Forest is unsupervised, but the labels exist and are the only way
-    to know whether the model is worth deploying, so they are used for
-    evaluation and threshold selection even though they never reach `fit`.
-    """
+    """Fit, evaluate, pick a threshold, and serialize."""
     if not Path(data_path).exists():
         raise FileNotFoundError(
             f"{data_path} not found. Download the Kaggle credit card fraud "
@@ -96,56 +183,53 @@ def train(
         )
 
     df = pd.read_csv(data_path)
-    if LABEL_COLUMN not in df.columns:
-        raise ValueError(f"{data_path} has no {LABEL_COLUMN} column to evaluate against")
+    for required in (LABEL_COLUMN, TIME_COLUMN):
+        if required not in df.columns:
+            raise ValueError(f"{data_path} has no {required} column")
 
     X = preprocess(df)
     y = df[LABEL_COLUMN].to_numpy()
+    strata = _strata(df, time_bucket_hours)
 
-    # Stratified so the ~0.17% positives are represented in both halves.
+    cv = None
+    if cv_folds > 1:
+        cv = _cross_validate(
+            X, y, strata, alert_rate, cv_folds, include_anomaly_score, random_state
+        )
+
+    forward = _time_forward(df, X, y, alert_rate, include_anomaly_score, random_state)
+
+    # The shipped model: fit on the training share, threshold from the holdout.
     X_train, X_val, y_train, y_val = train_test_split(
-        X, y, test_size=0.3, stratify=y, random_state=random_state
+        X, y, test_size=0.3, stratify=strata, random_state=random_state
     )
+    pipeline = build_pipeline(random_state, include_anomaly_score)
+    pipeline.fit(X_train, y_train)
 
-    # Fitting on all rows, contamination included, beats fitting on labelled-
-    # clean rows only: mean average precision 0.188 vs 0.140 across five seeds
-    # on the Kaggle data, and better in every individual run. At a 0.17%
-    # positive rate the frauds barely perturb the fit, so the novelty-detector
-    # framing buys nothing. `--fit-on-normals` keeps the comparison available.
-    X_fit = X_train[y_train == 0] if fit_on_normals_only else X_train
-
-    pipeline = _build_pipeline(contamination=alert_rate, random_state=random_state)
-    pipeline.fit(X_fit)
-
-    # decision_function is signed with lower meaning more anomalous, so negate
-    # it to get a score that increases with fraud likelihood for the metrics.
-    val_scores = pipeline.decision_function(X_val)
-    fraud_likelihood = -val_scores
-
-    average_precision = float(average_precision_score(y_val, fraud_likelihood))
-    roc_auc = float(roc_auc_score(y_val, fraud_likelihood))
-
-    # Threshold at the alert budget: flag the `alert_rate` most anomalous.
-    threshold = float(np.percentile(val_scores, alert_rate * 100))
-    flagged = val_scores < threshold
-    caught = int(((flagged) & (y_val == 1)).sum())
-    precision = float(caught / flagged.sum()) if flagged.sum() else 0.0
-    recall = float(caught / (y_val == 1).sum()) if (y_val == 1).sum() else 0.0
+    holdout = _evaluate(fraud_scores(pipeline, X_val), y_val, alert_rate)
 
     metrics = {
-        "average_precision": average_precision,
-        "roc_auc": roc_auc,
-        "precision_at_threshold": precision,
-        "recall_at_threshold": recall,
+        "average_precision": holdout["average_precision"],
+        "roc_auc": holdout["roc_auc"],
+        "precision_at_threshold": holdout["precision_at_threshold"],
+        "recall_at_threshold": holdout["recall_at_threshold"],
         "alert_rate": alert_rate,
-        "n_train": int(len(X_fit)),
+        "model": "hybrid" if include_anomaly_score else "supervised",
+        "split": f"stratified on label x {time_bucket_hours}h time bucket",
+        "n_train": int(len(X_train)),
         "n_val": int(len(X_val)),
-        "n_val_fraud": int((y_val == 1).sum()),
+        "n_val_fraud": holdout["n_fraud"],
+        "cross_validation": cv,
+        "time_forward": {
+            k: forward[k]
+            for k in ("average_precision", "precision_at_threshold", "recall_at_threshold")
+        },
     }
 
     artifact = {
         "pipeline": pipeline,
-        "threshold": threshold,
+        "threshold": holdout["threshold"],
+        "score_type": SCORE_TYPE,
         "feature_order": FEATURE_ORDER,
         "version": _resolve_version(),
         "trained_at": datetime.now(timezone.utc).isoformat(),
@@ -157,12 +241,28 @@ def train(
 
     # Average precision is the number to watch. ROC-AUC looks flattering at
     # 0.17% positives and says very little about review workload.
-    print(f"Model saved to {output_path} (version {artifact['version']})")
-    print(f"  average precision : {average_precision:.4f}")
-    print(f"  roc auc           : {roc_auc:.4f}")
+    print(f"Model saved to {output_path} (version {artifact['version']}, {metrics['model']})")
+    print(f"  holdout ({metrics['split']}):")
+    print(f"    average precision : {holdout['average_precision']:.4f}")
+    print(f"    roc auc           : {holdout['roc_auc']:.4f}")
     print(
-        f"  at {alert_rate:.2%} alert rate: precision {precision:.4f}, "
-        f"recall {recall:.4f} ({caught}/{metrics['n_val_fraud']} frauds caught)"
+        f"    at {alert_rate:.2%} alert rate: precision {holdout['precision_at_threshold']:.4f}, "
+        f"recall {holdout['recall_at_threshold']:.4f} "
+        f"({holdout['caught']}/{holdout['n_fraud']} frauds caught)"
+    )
+    if cv:
+        print(f"  {cv['folds']}-fold cross-validation (mean +/- std):")
+        for key, label in (
+            ("average_precision", "average precision"),
+            ("precision_at_threshold", "precision at alert"),
+            ("recall_at_threshold", "recall at alert"),
+        ):
+            print(f"    {label:<18}: {cv[key]['mean']:.4f} +/- {cv[key]['std']:.4f}")
+    print("  time-forward (fit first 24h, test last 24h):")
+    print(
+        f"    average precision {forward['average_precision']:.4f}, "
+        f"precision {forward['precision_at_threshold']:.4f}, "
+        f"recall {forward['recall_at_threshold']:.4f}"
     )
     return artifact
 
@@ -178,9 +278,21 @@ def _parse_args() -> argparse.Namespace:
         help="share of traffic to flag; set from review capacity",
     )
     parser.add_argument(
-        "--fit-on-normals",
+        "--no-anomaly-score",
         action="store_true",
-        help="fit on labelled-clean rows only (scores worse; kept for comparison)",
+        help="supervised classifier only, without the Isolation Forest feature",
+    )
+    parser.add_argument(
+        "--time-bucket-hours",
+        type=int,
+        default=DEFAULT_TIME_BUCKET_HOURS,
+        help="width of the time buckets the split is stratified on",
+    )
+    parser.add_argument(
+        "--cv-folds",
+        type=int,
+        default=DEFAULT_CV_FOLDS,
+        help="cross-validation folds for the metric spread; 0 or 1 to skip",
     )
     return parser.parse_args()
 
@@ -191,5 +303,7 @@ if __name__ == "__main__":
         data_path=args.data_path,
         output_path=args.output_path,
         alert_rate=args.alert_rate,
-        fit_on_normals_only=args.fit_on_normals,
+        include_anomaly_score=not args.no_anomaly_score,
+        time_bucket_hours=args.time_bucket_hours,
+        cv_folds=args.cv_folds,
     )

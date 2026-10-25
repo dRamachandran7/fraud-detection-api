@@ -4,7 +4,8 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from datetime import datetime
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request, Response
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, generate_latest
 
 from src import config
 from src.api.kafka_producer import PublishError, publish_transaction, shutdown_producer
@@ -21,6 +22,29 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Fraud Detection API", lifespan=lifespan)
+
+REQUESTS = Counter(
+    "fraud_api_requests_total",
+    "HTTP requests by route template and status",
+    ["method", "route", "status"],
+)
+
+
+@app.middleware("http")
+async def count_requests(request: Request, call_next):
+    response = await call_next(request)
+    # Label by route template, not raw path: /transactions/{transaction_id}
+    # stays one series instead of one per transaction.
+    route = request.scope.get("route")
+    REQUESTS.labels(
+        request.method, route.path if route else "unmatched", str(response.status_code)
+    ).inc()
+    return response
+
+
+@app.get("/metrics", include_in_schema=False)
+def metrics() -> Response:
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 # Deliberately sync: publish_transaction blocks on the broker ack, and FastAPI

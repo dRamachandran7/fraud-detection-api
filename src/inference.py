@@ -6,7 +6,8 @@ import joblib
 from src import config
 from src.model.preprocess import features_to_frame, preprocess
 
-REQUIRED_ARTIFACT_KEYS = {"pipeline", "threshold", "feature_order", "version"}
+REQUIRED_ARTIFACT_KEYS = {"pipeline", "threshold", "score_type", "feature_order", "version"}
+SUPPORTED_SCORE_TYPE = "fraud_probability"
 
 
 class ArtifactError(RuntimeError):
@@ -28,6 +29,12 @@ def load_model() -> dict:
             "Retrain with `python -m src.model.train`."
         )
 
+    if artifact["score_type"] != SUPPORTED_SCORE_TYPE:
+        raise ArtifactError(
+            f"artifact score_type is {artifact['score_type']!r}; this service "
+            f"only knows how to threshold {SUPPORTED_SCORE_TYPE!r}."
+        )
+
     expected = len(artifact["feature_order"])
     if expected != config.EXPECTED_FEATURE_COUNT:
         raise ArtifactError(
@@ -39,18 +46,30 @@ def load_model() -> dict:
     return artifact
 
 
+def predict_batch(artifact: dict, rows: list[list[float]]) -> list[dict]:
+    """Score many transactions in one model call, in input order.
+
+    Each result has is_fraud, score and model_version. `score` is the model's
+    probability of fraud, 0 to 1. `is_fraud` compares it against the
+    artifact's threshold, which was set from the alert budget at train time —
+    not against 0.5.
+    """
+    if not rows:
+        return []
+
+    X = preprocess(features_to_frame(rows))
+    scores = artifact["pipeline"].predict_proba(X)[:, 1]
+    if len(scores) != len(rows):
+        raise RuntimeError(f"model returned {len(scores)} scores for {len(rows)} rows")
+
+    threshold = artifact["threshold"]
+    version = artifact["version"]
+    return [
+        {"is_fraud": bool(s >= threshold), "score": float(s), "model_version": version}
+        for s in scores
+    ]
+
+
 def predict(artifact: dict, features: list[float]) -> dict:
-    """Score a single transaction. Returns dict with is_fraud, score, version."""
-    X = preprocess(features_to_frame(features))
-
-    # decision_function is signed: lower is more anomalous. The threshold was
-    # chosen on held-out data at train time, so we compare against it directly
-    # rather than calling .predict(), whose boundary comes from `contamination`
-    # and is not tuned to the alert budget.
-    raw_score = artifact["pipeline"].decision_function(X)[0]
-
-    return {
-        "is_fraud": bool(raw_score < artifact["threshold"]),
-        "score": float(raw_score),
-        "model_version": artifact["version"],
-    }
+    """Score a single transaction. See predict_batch."""
+    return predict_batch(artifact, [features])[0]
